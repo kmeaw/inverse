@@ -1,0 +1,8 @@
+*~
+.*.sw[ponm]
+known_hosts
+inverse
+id_rsa
+id_rsa.pub
+id_ed25519
+id_ed25519.pub
