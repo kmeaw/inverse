@@ -226,7 +226,7 @@ func (session *Session) handle() {
 	session.forwards.RLock()
 	defer session.forwards.RUnlock()
 
-	if _, ok := session.forwards.rports[22]; !ok {
+	if _, ok := session.forwards.m[22]; !ok {
 		fmt.Fprintf(session.ch, "Uh, oh, you forgot to forward port 22 to your host.\r\n")
 		fmt.Fprintf(session.ch, "Please re-run your SSH client with -R 22:localhost:22\r\n")
 		session.ch.Close()
@@ -268,13 +268,20 @@ type Session struct {
 	handled  bool
 	forwards *Forwards
 	cancel   context.CancelFunc
+	isReady  bool
 
 	sync.Mutex
 }
 
+type Forward struct {
+	laddr string
+	lport int
+	rport uint32
+	tcp   *net.TCPListener
+}
+
 type Forwards struct {
-	rports map[uint32]string
-	lports map[uint32]int
+	m map[uint32]*Forward
 
 	sync.RWMutex
 	context context.Context
@@ -494,6 +501,7 @@ func (session *Session) verify(hosts *HostMap) error {
 	return nil
 }
 
+// FIXME: refactor: (f *Forward) Start(session *Session)
 func forwardPort(tcp *net.TCPListener, laddr string, port uint32, session *Session) {
 	go func() {
 		<-session.forwards.context.Done()
@@ -504,7 +512,9 @@ func forwardPort(tcp *net.TCPListener, laddr string, port uint32, session *Sessi
 		conn, err := tcp.AcceptTCP()
 		if err != nil {
 			log.Printf("cannot accept connection: %s\n", err)
-			fmt.Fprintf(session, "accept (port %d) failed: %s\r\n", port, err)
+			if ! strings.Contains(err.Error(), "use of closed network connection") {
+				fmt.Fprintf(session, "accept (port %d) failed: %s\r\n", port, err)
+			}
 			break
 		}
 
@@ -570,24 +580,56 @@ func forwardPort(tcp *net.TCPListener, laddr string, port uint32, session *Sessi
 
 func (forwards *Forwards) Start(session *Session) error {
 	forwards.Lock()
-	for port, lhost := range session.forwards.rports {
-		tcp, err := net.ListenTCP("tcp", &net.TCPAddr{})
+	defer forwards.Unlock()
+
+	for _, fwd := range forwards.m {
+		err := fwd.Start(session)
 		if err != nil {
-			log.Printf("cannot open listening socket: %s\n", err)
 			return err
 		}
-
-		forwards.lports[port] = tcp.Addr().(*net.TCPAddr).Port
-		go forwardPort(tcp, lhost, port, session)
 	}
-	forwards.Unlock()
 
 	return nil
+}
+
+func (forwards *Forwards) Print(session *Session) {
+	forwards.RLock()
+	defer forwards.RUnlock()
+
+	for _, fwd := range session.forwards.m {
+		fwd.Print(session)
+	}
+}
+
+func (fwd *Forward) Print(session *Session) {
+	fmt.Fprintf(session.ch, "TCP:%d -> SSH:%d\r\n", fwd.lport, fwd.rport)
+}
+
+func (forward *Forward) Start(session *Session) error {
+	tcp, err := net.ListenTCP("tcp", &net.TCPAddr{})
+	if err != nil {
+		log.Printf("cannot open listening socket: %s\n", err)
+		return err
+	}
+
+	forward.lport = tcp.Addr().(*net.TCPAddr).Port
+	forward.tcp = tcp
+	go forwardPort(tcp, forward.laddr, forward.rport, session)
+
+	return nil
+}
+
+func (forward *Forward) Stop() error {
+	return forward.tcp.Close()
 }
 
 func (session *Session) ready(hosts *HostMap) {
 	session.Lock()
 	defer session.Unlock()
+
+	if session.isReady {
+		return
+	}
 
 	log.Println("Ready.")
 
@@ -631,11 +673,9 @@ func (session *Session) ready(hosts *HostMap) {
 		fmt.Fprintf(session.ch, "Nice to meet you, %s!\r\n", session.server.User())
 	}
 
-	session.forwards.RLock()
-	for port, _ := range session.forwards.rports {
-		fmt.Fprintf(session.ch, "TCP:%d -> SSH:%d\r\n", session.forwards.lports[port], port)
-	}
-	session.forwards.RUnlock()
+	session.forwards.Print(session)
+
+	session.isReady = true
 }
 
 func (session *Session) Wait() (err error) {
@@ -690,9 +730,11 @@ func (session *Session) Close() error {
 }
 
 func (session *Session) handlePortForward(hosts *HostMap, msg channelForwardMsg) {
+	fwd := &Forward{laddr: msg.Laddr, rport: msg.Port}
+
 	session.Lock()
 	session.forwards.Lock()
-	session.forwards.rports[msg.Port] = msg.Laddr
+	session.forwards.m[msg.Port] = fwd
 	session.forwards.Unlock()
 	session.Unlock()
 
@@ -741,7 +783,31 @@ func (session *Session) handlePortForward(hosts *HostMap, msg channelForwardMsg)
 
 		session.ready(hosts)
 		session.Wait()
+		return
 	}
+
+	if session.isReady {
+		err := fwd.Start(session)
+		if err == nil {
+			fwd.Print(session)
+		} else {
+			fmt.Fprintf(session, "error: %s\n", err)
+		}
+	}
+}
+
+func (session *Session) handlePortForwardCancel(hosts *HostMap, msg channelForwardMsg) {
+	session.Lock()
+	session.forwards.Lock()
+	fwd := session.forwards.m[msg.Port]
+	old_port := fwd.lport
+	delete(session.forwards.m, msg.Port)
+	session.forwards.Unlock()
+	session.Unlock()
+
+	log.Printf("-KR %s:%d\n", msg.Laddr, msg.Port)
+	fwd.Stop()
+	fmt.Fprintf(session.ch, "TCP:%d -> closed\r\n", old_port)
 }
 
 func (session *Session) handleConnRequests(hosts *HostMap, in <-chan *ssh.Request) {
@@ -761,6 +827,16 @@ func (session *Session) handleConnRequests(hosts *HostMap, in <-chan *ssh.Reques
 			if req.WantReply {
 				req.Reply(false, nil)
 			}
+		case "cancel-tcpip-forward":
+			msg := channelForwardMsg{}
+			err := ssh.Unmarshal(req.Payload, &msg)
+			if err != nil {
+				log.Printf("cannot unmarshal channelForwardMsg: %s\n", err)
+				req.Reply(false, nil)
+				return
+			}
+			req.Reply(true, ssh.Marshal(channelForwardMsgReply{0}))
+			go session.handlePortForwardCancel(hosts, msg)
 		default:
 			log.Printf("handleConnRequests: discarding request %#v\n", req)
 			if req.WantReply {
@@ -885,8 +961,7 @@ func handleConn(s net.Conn, hosts *HostMap, config ssh.ServerConfig) error {
 	session := &Session{
 		server: server,
 		forwards: &Forwards{
-			rports: make(map[uint32]string),
-			lports: make(map[uint32]int),
+			m: make(map[uint32]*Forward),
 		},
 		start: time.Now(),
 		host:  host,
