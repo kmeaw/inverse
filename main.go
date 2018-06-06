@@ -12,6 +12,7 @@ import (
 	"io/ioutil"
 	"log"
 	"net"
+	"net/http"
 	"net/url"
 	"os"
 	"strings"
@@ -19,6 +20,8 @@ import (
 	"time"
 
 	"github.com/chzyer/readline"
+
+	_ "net/http/pprof"
 )
 
 type Host struct {
@@ -224,12 +227,13 @@ func (session *Session) handle() {
 	session.handled = true
 
 	session.forwards.RLock()
-	defer session.forwards.RUnlock()
+	_, ok := session.forwards.m[22]
+	session.forwards.RUnlock()
 
-	if _, ok := session.forwards.m[22]; !ok {
+	if !ok {
 		fmt.Fprintf(session.ch, "Uh, oh, you forgot to forward port 22 to your host.\r\n")
 		fmt.Fprintf(session.ch, "Please re-run your SSH client with -R 22:localhost:22\r\n")
-		session.ch.Close()
+		session.close()
 	}
 }
 
@@ -267,6 +271,7 @@ type Session struct {
 	pty      bool
 	handled  bool
 	forwards *Forwards
+	tun      ssh.Channel
 	cancel   context.CancelFunc
 	isReady  bool
 
@@ -592,6 +597,15 @@ func (forwards *Forwards) Start(session *Session) error {
 	return nil
 }
 
+func (forwards *Forwards) Stop() {
+	forwards.Lock()
+	defer forwards.Unlock()
+
+	for _, fwd := range forwards.m {
+		fwd.Stop()
+	}
+}
+
 func (forwards *Forwards) Print(session *Session) {
 	forwards.RLock()
 	defer forwards.RUnlock()
@@ -675,6 +689,10 @@ func (session *Session) ready(hosts *HostMap) {
 
 	session.forwards.Print(session)
 
+	if session.tun != nil {
+		fmt.Fprintf(session.ch, "Tunnel has been established.\r\n")
+	}
+
 	session.isReady = true
 }
 
@@ -701,7 +719,7 @@ func (session *Session) Wait() (err error) {
 
 	session.Lock()
 	session.cancel()
-	session.ch.Close()
+	session.close()
 	session.Unlock()
 
 	return
@@ -722,11 +740,21 @@ func (session *Session) Close() error {
 	session.Lock()
 	defer session.Unlock()
 
-	if session.ch == nil {
-		return session.server.Close()
+	return session.close()
+}
+
+func (session *Session) close() error {
+	session.forwards.Stop()
+
+	if session.tun != nil {
+		session.tun.Close()
 	}
 
-	return session.ch.Close()
+	if session.ch != nil {
+		return session.ch.Close()
+	} else {
+		return session.server.Close()
+	}
 }
 
 func (session *Session) handlePortForward(hosts *HostMap, msg channelForwardMsg) {
@@ -924,6 +952,22 @@ func (session *Session) handleRequests(reqs <-chan *ssh.Request) {
 	}
 }
 
+type channelTunnelOpenMsg struct {
+	Mode	uint32
+	Unit	uint32 // 0x7fffffff is auto
+}
+
+type L3PacketMsg struct {
+	Len	uint32
+	AF	uint32 // IPv4:2, IPv6:24
+	Data	[]byte // len-4
+}
+
+type L2PacketMsg struct {
+	Len	uint32
+	Frame	[]byte // len
+}
+
 func (session *Session) handleChannel(c ssh.NewChannel) {
 	switch c.ChannelType() {
 	case "session":
@@ -937,6 +981,31 @@ func (session *Session) handleChannel(c ssh.NewChannel) {
 		session.ch = ch
 		session.Unlock()
 		go session.handleRequests(reqs)
+
+	case "tun@openssh.com":
+		msg := channelTunnelOpenMsg{}
+		err := ssh.Unmarshal(c.ExtraData(), &msg)
+		if err != nil {
+			log.Printf("cannot unmarshal channelTunnelOpenMsg: %s\n", err)
+			c.Reject(ssh.Prohibited, "bad request")
+			return
+		}
+
+		ch, reqs, err := c.Accept()
+		if err != nil {
+			log.Printf("cannot accept tun: %s\n", err)
+			return
+		}
+
+		session.Lock()
+		old_ch := session.tun
+		session.tun = ch
+		session.Unlock()
+		go DiscardRequests("tun@openssh.com", reqs)
+
+		if old_ch != nil {
+			old_ch.Close()
+		}
 
 	default:
 		log.Printf("Rejecting channel request, type=%s\n", c.ChannelType())
@@ -1075,6 +1144,10 @@ func main() {
 	if k == 0 {
 		panic("ssh: no server keys")
 	}
+
+	go func() {
+		panic(http.ListenAndServe("localhost:6060", nil))
+	}() // enable pprof
 
 	panic(listenAndServe(hosts, server_config))
 }
